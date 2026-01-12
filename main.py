@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from telegram import Bot
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+
 
 from supabase_db import (
     db_get_state, db_update_state, db_get_params,
@@ -213,13 +215,64 @@ def parse_number(s: str) -> float:
     return float(s.replace(",", "."))
 
 
+def build_main_menu() -> InlineKeyboardMarkup:
+    kb = [
+        [
+            InlineKeyboardButton("📊 Status", callback_data="STATUS"),
+            InlineKeyboardButton("⚙️ Params", callback_data="PARAMS"),
+        ],
+        [
+            InlineKeyboardButton("⏸️ Pause", callback_data="PAUSE"),
+            InlineKeyboardButton("▶️ Resume", callback_data="RESUME"),
+        ],
+        [
+            InlineKeyboardButton("🧪 Preset", callback_data="PRESETS"),
+            InlineKeyboardButton("🛑 Kill", callback_data="KILL"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data="REFRESH"),
+        ],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def build_presets_menu() -> InlineKeyboardMarkup:
+    kb = [
+        [
+            InlineKeyboardButton("🧊 Conservativo", callback_data="PRESET_CONS"),
+        ],
+        [
+            InlineKeyboardButton("⚖️ Bilanciato", callback_data="PRESET_BAL"),
+        ],
+        [
+            InlineKeyboardButton("🔥 Aggressivo", callback_data="PRESET_AGGR"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ Indietro", callback_data="MENU"),
+        ],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+def format_params(params: dict) -> str:
+    return (
+        "⚙️ Parametri attuali\n"
+        f"- w_max: {params['w_max']}\n"
+        f"- band: {params['band']}\n"
+        f"- fee_taker: {params['fee_taker']}\n"
+        f"- slippage_base: {params['slippage_base']}\n"
+        f"- buffer: {params['buffer']}\n"
+        f"- edge_mult: {params['edge_mult']}\n"
+        f"- max_trade_eur: {params['max_trade_eur']}\n"
+        f"- daily_stop: {params['daily_stop']}\n"
+        f"- max_trades_day: {params['max_trades_day']}\n"
+        "\nModifica: /set <chiave> <valore> (es: /set band 0.04)"
+    )
+
+
 async def process_telegram_commands(bot: Bot, chat_id: str, state: dict) -> dict:
     offset = int(state.get("telegram_offset") or 0)
     updates = await bot.get_updates(offset=offset, timeout=0)
     max_update_id = offset - 1
 
-    # whitelist parametri modificabili + tipo atteso
-    # (numeric: float; int: int)
     allowed_params = {
         "w_max": "float",
         "band": "float",
@@ -232,115 +285,160 @@ async def process_telegram_commands(bot: Bot, chat_id: str, state: dict) -> dict
         "max_trades_day": "int",
     }
 
+    async def send_menu(text: str | None = None):
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text or "📌 Menu",
+            reply_markup=build_main_menu()
+        )
+
+    async def reply_status():
+        snap = db_get_last_snapshot()
+        last_trade = db_get_last_trade()
+
+        eur = float(state["paper_eur"])
+        btc = float(state["paper_btc"])
+
+        out = (
+            f"📊 Status\n"
+            f"- Mode: {state['mode']} | Status: {state['status']} | Kill: {state['kill_switch']}\n"
+            f"- PAPER: EUR {fmt_eur(eur)} | BTC {fmt_btc(btc)}\n"
+        )
+
+        if snap:
+            equity = float(snap["equity_total"])
+            w_btc = float(snap["w_btc"])
+            pnl_day = float(snap["pnl_day"] or 0.0)
+            out += (
+                f"- Equity: {fmt_eur(equity)} | BTC%: {fmt_pct(w_btc)} | P&L day: {fmt_eur(pnl_day)}\n"
+                f"- Bid/Ask: {float(snap['bid']):.2f} / {float(snap['ask']):.2f}\n"
+            )
+
+        if last_trade:
+            out += (
+                "\n🧾 Ultima decisione\n"
+                f"- {last_trade['action']} | w {float(last_trade['w_current']):.2%} → {float(last_trade['w_target']):.2%}\n"
+                f"- r_hat: {fmt_pct(float(last_trade['r_hat'] or 0.0))} | cost: {fmt_pct(float(last_trade['cost_pct'] or 0.0))}\n"
+                f"- reason: {last_trade.get('reason')}"
+            )
+
+        await bot.send_message(chat_id=chat_id, text=out, reply_markup=build_main_menu())
+
+    async def reply_params():
+        params = db_get_params()
+        await bot.send_message(chat_id=chat_id, text=format_params(params), reply_markup=build_main_menu())
+
+    async def apply_preset(kind: str):
+        # Preset = modifica di parametri “chiave” per vedere comportamenti diversi
+        # (puoi cambiare numeri quando vuoi)
+        if kind == "CONS":
+            db_update_param("edge_mult", 2.0)
+            db_update_param("band", 0.06)
+            db_update_param("w_max", 0.30)
+        elif kind == "BAL":
+            db_update_param("edge_mult", 1.5)
+            db_update_param("band", 0.05)
+            db_update_param("w_max", 0.40)
+        elif kind == "AGGR":
+            db_update_param("edge_mult", 1.2)
+            db_update_param("band", 0.03)
+            db_update_param("w_max", 0.50)
+
+        p = db_get_params()
+        await bot.send_message(chat_id=chat_id, text=f"✅ Preset applicato.\n\n{format_params(p)}", reply_markup=build_main_menu())
+
     for u in updates:
         if u.update_id > max_update_id:
             max_update_id = u.update_id
 
+        # 1) Callback dei bottoni
+        if u.callback_query:
+            cq = u.callback_query
+            if str(cq.message.chat_id) != str(chat_id):
+                continue
+
+            data = (cq.data or "").strip()
+            await bot.answer_callback_query(cq.id)
+
+            if data in ("MENU", "REFRESH"):
+                await send_menu("📌 Menu aggiornato")
+            elif data == "STATUS":
+                await reply_status()
+            elif data == "PARAMS":
+                await reply_params()
+            elif data == "PAUSE":
+                state["status"] = "PAUSED"
+                await bot.send_message(chat_id=chat_id, text="⏸️ Ok, bot in PAUSED.", reply_markup=build_main_menu())
+            elif data == "RESUME":
+                state["status"] = "RUNNING"
+                await bot.send_message(chat_id=chat_id, text="▶️ Ok, bot in RUNNING.", reply_markup=build_main_menu())
+            elif data == "PRESETS":
+                await bot.send_message(chat_id=chat_id, text="🧪 Scegli un preset:", reply_markup=build_presets_menu())
+            elif data == "PRESET_CONS":
+                await apply_preset("CONS")
+            elif data == "PRESET_BAL":
+                await apply_preset("BAL")
+            elif data == "PRESET_AGGR":
+                await apply_preset("AGGR")
+            elif data == "KILL":
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Conferma KILL", callback_data="CONFIRM_KILL"),
+                    InlineKeyboardButton("❌ Annulla", callback_data="MENU"),
+                ]])
+                await bot.send_message(chat_id=chat_id, text="🛑 Vuoi davvero fermare il bot?", reply_markup=kb)
+            elif data == "CONFIRM_KILL":
+                state["kill_switch"] = True
+                await bot.send_message(chat_id=chat_id, text="🛑 Kill switch attivo. Il bot si fermerà.", reply_markup=build_main_menu())
+            continue
+
+        # 2) Messaggi testo
         msg = u.message
         if not msg or not msg.text:
             continue
-
         if str(msg.chat_id) != str(chat_id):
             continue
 
         text = msg.text.strip()
         db_log_command(msg.from_user.id if msg.from_user else None, text)
 
+        if text in ("/start", "/menu"):
+            await send_menu("👋 Ciao! Usa i bottoni qui sotto:")
+            continue
+
         if text == "/pause":
             state["status"] = "PAUSED"
-            await bot.send_message(chat_id=chat_id, text="⏸️ Ok, bot in PAUSED.")
+            await bot.send_message(chat_id=chat_id, text="⏸️ Ok, bot in PAUSED.", reply_markup=build_main_menu())
             continue
 
         if text == "/resume":
             state["status"] = "RUNNING"
-            await bot.send_message(chat_id=chat_id, text="▶️ Ok, bot in RUNNING.")
+            await bot.send_message(chat_id=chat_id, text="▶️ Ok, bot in RUNNING.", reply_markup=build_main_menu())
             continue
 
         if text == "/kill":
             state["kill_switch"] = True
-            await bot.send_message(chat_id=chat_id, text="🛑 Kill switch attivo. Il bot si fermerà.")
-            continue
-
-        if text == "/paper":
-            state["mode"] = "PAPER"
-            state["armed"] = False
-            await bot.send_message(chat_id=chat_id, text="✅ Mode impostato su PAPER.")
-            continue
-
-        if text == "/live":
-            state["mode"] = "LIVE"
-            state["armed"] = True
-            await bot.send_message(chat_id=chat_id, text="⚠️ LIVE ARMED. (Trading live non implementato ancora) Usa /confirm_live quando sarà pronto.")
-            continue
-
-        if text == "/confirm_live":
-            await bot.send_message(chat_id=chat_id, text="ℹ️ LIVE non ancora implementato in questo progetto (paper only).")
-            continue
-
-        if text == "/params":
-            params = db_get_params()
-            msg_out = (
-                "⚙️ Parametri attuali\n"
-                f"- w_max: {params['w_max']}\n"
-                f"- band: {params['band']}\n"
-                f"- fee_taker: {params['fee_taker']}\n"
-                f"- slippage_base: {params['slippage_base']}\n"
-                f"- buffer: {params['buffer']}\n"
-                f"- edge_mult: {params['edge_mult']}\n"
-                f"- max_trade_eur: {params['max_trade_eur']}\n"
-                f"- daily_stop: {params['daily_stop']}\n"
-                f"- max_trades_day: {params['max_trades_day']}\n"
-                "\nModifica: /set <chiave> <valore>  (es: /set band 0.04)"
-            )
-            await bot.send_message(chat_id=chat_id, text=msg_out)
+            await bot.send_message(chat_id=chat_id, text="🛑 Kill switch attivo. Il bot si fermerà.", reply_markup=build_main_menu())
             continue
 
         if text == "/status":
-            snap = db_get_last_snapshot()
-            last_trade = db_get_last_trade()
+            await reply_status()
+            continue
 
-            eur = float(state["paper_eur"])
-            btc = float(state["paper_btc"])
-            base = (
-                f"📊 Status\n"
-                f"- Mode: {state['mode']} | Status: {state['status']} | Kill: {state['kill_switch']}\n"
-                f"- PAPER: EUR {fmt_eur(eur)} | BTC {fmt_btc(btc)}\n"
-            )
-
-            if snap:
-                equity = float(snap["equity_total"])
-                w_btc = float(snap["w_btc"])
-                pnl_day = float(snap["pnl_day"] or 0.0)
-                base += (
-                    f"- Equity: {fmt_eur(equity)} | BTC%: {fmt_pct(w_btc)} | P&L day: {fmt_eur(pnl_day)}\n"
-                    f"- Bid/Ask: {float(snap['bid']):.2f} / {float(snap['ask']):.2f}\n"
-                )
-
-            if last_trade:
-                base += (
-                    "\n🧾 Ultima decisione\n"
-                    f"- {last_trade['action']} | w {float(last_trade['w_current']):.2%} → {float(last_trade['w_target']):.2%}\n"
-                    f"- r_hat: {fmt_pct(float(last_trade['r_hat'] or 0.0))} | cost: {fmt_pct(float(last_trade['cost_pct'] or 0.0))}\n"
-                    f"- reason: {last_trade.get('reason')}"
-                )
-
-            await bot.send_message(chat_id=chat_id, text=base)
+        if text == "/params":
+            await reply_params()
             continue
 
         if text.startswith("/set "):
             parts = text.split()
             if len(parts) != 3:
-                await bot.send_message(chat_id=chat_id, text="Uso: /set <chiave> <valore>  (es: /set band 0.04)")
+                await bot.send_message(chat_id=chat_id, text="Uso: /set <chiave> <valore>  (es: /set band 0.04)", reply_markup=build_main_menu())
                 continue
 
             key = parts[1].strip()
             val_raw = parts[2].strip()
 
             if key not in allowed_params:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text="Chiave non valida. Usa /params per vedere le chiavi disponibili.",
-                )
+                await bot.send_message(chat_id=chat_id, text="Chiave non valida. Usa /params.", reply_markup=build_main_menu())
                 continue
 
             try:
@@ -349,49 +447,44 @@ async def process_telegram_commands(bot: Bot, chat_id: str, state: dict) -> dict
                 else:
                     val = float(parse_number(val_raw))
             except Exception:
-                await bot.send_message(chat_id=chat_id, text="Valore non valido. Esempi: 0.05, 1.5, 20")
+                await bot.send_message(chat_id=chat_id, text="Valore non valido. Esempi: 0.05, 1.5, 20", reply_markup=build_main_menu())
                 continue
 
-            # controlli di sicurezza base (evita valori “assurdi”)
             if key in ("band", "w_max") and not (0 <= val <= 1):
-                await bot.send_message(chat_id=chat_id, text="Valore fuori range (0..1).")
+                await bot.send_message(chat_id=chat_id, text="Valore fuori range (0..1).", reply_markup=build_main_menu())
                 continue
             if key in ("fee_taker", "slippage_base", "buffer") and not (0 <= val <= 0.05):
-                await bot.send_message(chat_id=chat_id, text="Valore fuori range (0..0.05).")
+                await bot.send_message(chat_id=chat_id, text="Valore fuori range (0..0.05).", reply_markup=build_main_menu())
                 continue
             if key == "edge_mult" and not (1.0 <= val <= 5.0):
-                await bot.send_message(chat_id=chat_id, text="edge_mult fuori range (1..5).")
-                continue
-            if key == "max_trade_eur" and val <= 0:
-                await bot.send_message(chat_id=chat_id, text="max_trade_eur deve essere > 0.")
-                continue
+                await bot.send_me_
 
-            db_update_param(key, val)
-            await bot.send_message(chat_id=chat_id, text=f"✅ Aggiornato: {key} = {val}")
-            continue
-
-    if updates:
-        state["telegram_offset"] = max_update_id + 1
-
-    return state
 
 
 
 async def main_async():
     tg_token = os.environ["TELEGRAM_BOT_TOKEN"]
     tg_chat = os.environ["TELEGRAM_CHAT_ID"]
+    run_mode = os.environ.get("RUN_MODE", "trade").strip().lower()
 
     bot = Bot(token=tg_token)
 
     state = db_get_state()
+
+    # 1) commands mode: consuma update Telegram e risponde
+    if run_mode == "commands":
+        state = await process_telegram_commands(bot, tg_chat, state)
+        db_update_state(state)
+
+        if state.get("kill_switch"):
+            # opzionale: conferma visiva
+            await bot.send_message(chat_id=tg_chat, text="🛑 Kill switch attivo. Bot fermo.", reply_markup=build_main_menu())
+        return
+
+    # 2) trade mode: NON consuma update Telegram (li lascia al workflow commands)
     params = db_get_params()
 
-    # Leggi comandi (sempre)
-    state = await process_telegram_commands(bot, tg_chat, state)
-    db_update_state(state)
-
     if state.get("kill_switch"):
-        await bot.send_message(chat_id=tg_chat, text="🛑 Kill switch attivo. Bot fermo.")
         return
 
     # Finestra: primi 5 minuti dell'ora
