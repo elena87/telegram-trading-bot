@@ -230,8 +230,10 @@ def build_main_menu() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🛑 Kill", callback_data="KILL"),
         ],
         [
-            InlineKeyboardButton("🔄 Refresh", callback_data="REFRESH"),
+          InlineKeyboardButton("🔄 Refresh", callback_data="REFRESH"),
+          InlineKeyboardButton("🧹 Clear queue", callback_data="CLEARQ"),
         ],
+
     ]
     return InlineKeyboardMarkup(kb)
 
@@ -389,6 +391,11 @@ async def process_telegram_commands(bot: Bot, chat_id: str, state: dict) -> dict
             elif data == "CONFIRM_KILL":
                 state["kill_switch"] = True
                 await bot.send_message(chat_id=chat_id, text="🛑 Kill switch attivo. Il bot si fermerà.", reply_markup=build_main_menu())
+            elif data == "CLEARQ":
+                # setta offset all'ultimo update_id + 1 (li stiamo già iterando, quindi basta aggiornare max_update_id)
+                state["telegram_offset"] = max_update_id + 1
+                await bot.send_message(chat_id=chat_id, text="🧹 Queue ripulita ✅", reply_markup=build_main_menu())
+
             continue
 
         # 2) Messaggi testo
@@ -427,6 +434,12 @@ async def process_telegram_commands(bot: Bot, chat_id: str, state: dict) -> dict
         if text == "/params":
             await reply_params()
             continue
+
+        if text == "/clear":
+            state["telegram_offset"] = max_update_id + 1
+            await bot.send_message(chat_id=chat_id, text="🧹 Queue ripulita ✅", reply_markup=build_main_menu())
+            continue
+
 
         if text.startswith("/set "):
             parts = text.split()
