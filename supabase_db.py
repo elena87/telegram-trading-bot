@@ -63,3 +63,32 @@ def db_upsert_snapshot(ts, mode, eur, btc, bid, ask, mid, equity, w_btc, pnl_day
         "drawdown": drawdown
     }).execute()
 
+def db_update_param(key: str, value):
+    # aggiorna una sola colonna su bot_params (id=1)
+    sb().table("bot_params").update({key: value}).eq("id", 1).execute()
+
+def db_get_last_trade() -> dict | None:
+    res = (
+        sb()
+        .table("trades")
+        .select("*")
+        .order("ts", desc=True)
+        .limit(1)
+        .execute()
+    )
+    data = res.data or []
+    return data[0] if data else None
+
+def db_get_last_snapshot() -> dict | None:
+    res = (
+        sb()
+        .table("equity_snapshots")
+        .select("*")
+        .order("ts", desc=True)
+        .limit(1)
+        .execute()
+    )
+    data = res.data or []
+    return data[0] if data else None
+
+

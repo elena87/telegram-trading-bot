@@ -9,8 +9,10 @@ from telegram import Bot
 
 from supabase_db import (
     db_get_state, db_update_state, db_get_params,
-    db_log_command, db_insert_trade, db_upsert_snapshot
+    db_log_command, db_insert_trade, db_upsert_snapshot,
+    db_update_param, db_get_last_trade, db_get_last_snapshot
 )
+
 
 ROME = ZoneInfo("Europe/Rome")
 PRODUCT_ID = "BTC-EUR"
@@ -197,11 +199,38 @@ def paper_rebalance(state: dict, params: dict, bid: float, ask: float, mid: floa
     return new_state, trade_row
 
 
+def fmt_pct(x: float) -> str:
+    return f"{x*100:.2f}%"
+
+def fmt_eur(x: float) -> str:
+    return f"€{x:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+
+def fmt_btc(x: float) -> str:
+    return f"{x:.8f}"
+
+def parse_number(s: str) -> float:
+    # accetta "0.05" o "0,05"
+    return float(s.replace(",", "."))
+
+
 async def process_telegram_commands(bot: Bot, chat_id: str, state: dict) -> dict:
     offset = int(state.get("telegram_offset") or 0)
-
     updates = await bot.get_updates(offset=offset, timeout=0)
     max_update_id = offset - 1
+
+    # whitelist parametri modificabili + tipo atteso
+    # (numeric: float; int: int)
+    allowed_params = {
+        "w_max": "float",
+        "band": "float",
+        "slippage_base": "float",
+        "fee_taker": "float",
+        "buffer": "float",
+        "edge_mult": "float",
+        "max_trade_eur": "float",
+        "daily_stop": "float",
+        "max_trades_day": "int",
+    }
 
     for u in updates:
         if u.update_id > max_update_id:
@@ -220,25 +249,132 @@ async def process_telegram_commands(bot: Bot, chat_id: str, state: dict) -> dict
         if text == "/pause":
             state["status"] = "PAUSED"
             await bot.send_message(chat_id=chat_id, text="⏸️ Ok, bot in PAUSED.")
-        elif text == "/resume":
+            continue
+
+        if text == "/resume":
             state["status"] = "RUNNING"
             await bot.send_message(chat_id=chat_id, text="▶️ Ok, bot in RUNNING.")
-        elif text == "/kill":
+            continue
+
+        if text == "/kill":
             state["kill_switch"] = True
             await bot.send_message(chat_id=chat_id, text="🛑 Kill switch attivo. Il bot si fermerà.")
-        elif text == "/status":
-            await bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"Mode={state['mode']} Status={state['status']} Kill={state['kill_switch']}\n"
-                    f"PAPER EUR={float(state['paper_eur']):.2f} BTC={float(state['paper_btc']):.8f}"
-                ),
+            continue
+
+        if text == "/paper":
+            state["mode"] = "PAPER"
+            state["armed"] = False
+            await bot.send_message(chat_id=chat_id, text="✅ Mode impostato su PAPER.")
+            continue
+
+        if text == "/live":
+            state["mode"] = "LIVE"
+            state["armed"] = True
+            await bot.send_message(chat_id=chat_id, text="⚠️ LIVE ARMED. (Trading live non implementato ancora) Usa /confirm_live quando sarà pronto.")
+            continue
+
+        if text == "/confirm_live":
+            await bot.send_message(chat_id=chat_id, text="ℹ️ LIVE non ancora implementato in questo progetto (paper only).")
+            continue
+
+        if text == "/params":
+            params = db_get_params()
+            msg_out = (
+                "⚙️ Parametri attuali\n"
+                f"- w_max: {params['w_max']}\n"
+                f"- band: {params['band']}\n"
+                f"- fee_taker: {params['fee_taker']}\n"
+                f"- slippage_base: {params['slippage_base']}\n"
+                f"- buffer: {params['buffer']}\n"
+                f"- edge_mult: {params['edge_mult']}\n"
+                f"- max_trade_eur: {params['max_trade_eur']}\n"
+                f"- daily_stop: {params['daily_stop']}\n"
+                f"- max_trades_day: {params['max_trades_day']}\n"
+                "\nModifica: /set <chiave> <valore>  (es: /set band 0.04)"
             )
+            await bot.send_message(chat_id=chat_id, text=msg_out)
+            continue
+
+        if text == "/status":
+            snap = db_get_last_snapshot()
+            last_trade = db_get_last_trade()
+
+            eur = float(state["paper_eur"])
+            btc = float(state["paper_btc"])
+            base = (
+                f"📊 Status\n"
+                f"- Mode: {state['mode']} | Status: {state['status']} | Kill: {state['kill_switch']}\n"
+                f"- PAPER: EUR {fmt_eur(eur)} | BTC {fmt_btc(btc)}\n"
+            )
+
+            if snap:
+                equity = float(snap["equity_total"])
+                w_btc = float(snap["w_btc"])
+                pnl_day = float(snap["pnl_day"] or 0.0)
+                base += (
+                    f"- Equity: {fmt_eur(equity)} | BTC%: {fmt_pct(w_btc)} | P&L day: {fmt_eur(pnl_day)}\n"
+                    f"- Bid/Ask: {float(snap['bid']):.2f} / {float(snap['ask']):.2f}\n"
+                )
+
+            if last_trade:
+                base += (
+                    "\n🧾 Ultima decisione\n"
+                    f"- {last_trade['action']} | w {float(last_trade['w_current']):.2%} → {float(last_trade['w_target']):.2%}\n"
+                    f"- r_hat: {fmt_pct(float(last_trade['r_hat'] or 0.0))} | cost: {fmt_pct(float(last_trade['cost_pct'] or 0.0))}\n"
+                    f"- reason: {last_trade.get('reason')}"
+                )
+
+            await bot.send_message(chat_id=chat_id, text=base)
+            continue
+
+        if text.startswith("/set "):
+            parts = text.split()
+            if len(parts) != 3:
+                await bot.send_message(chat_id=chat_id, text="Uso: /set <chiave> <valore>  (es: /set band 0.04)")
+                continue
+
+            key = parts[1].strip()
+            val_raw = parts[2].strip()
+
+            if key not in allowed_params:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="Chiave non valida. Usa /params per vedere le chiavi disponibili.",
+                )
+                continue
+
+            try:
+                if allowed_params[key] == "int":
+                    val = int(parse_number(val_raw))
+                else:
+                    val = float(parse_number(val_raw))
+            except Exception:
+                await bot.send_message(chat_id=chat_id, text="Valore non valido. Esempi: 0.05, 1.5, 20")
+                continue
+
+            # controlli di sicurezza base (evita valori “assurdi”)
+            if key in ("band", "w_max") and not (0 <= val <= 1):
+                await bot.send_message(chat_id=chat_id, text="Valore fuori range (0..1).")
+                continue
+            if key in ("fee_taker", "slippage_base", "buffer") and not (0 <= val <= 0.05):
+                await bot.send_message(chat_id=chat_id, text="Valore fuori range (0..0.05).")
+                continue
+            if key == "edge_mult" and not (1.0 <= val <= 5.0):
+                await bot.send_message(chat_id=chat_id, text="edge_mult fuori range (1..5).")
+                continue
+            if key == "max_trade_eur" and val <= 0:
+                await bot.send_message(chat_id=chat_id, text="max_trade_eur deve essere > 0.")
+                continue
+
+            db_update_param(key, val)
+            await bot.send_message(chat_id=chat_id, text=f"✅ Aggiornato: {key} = {val}")
+            continue
 
     if updates:
         state["telegram_offset"] = max_update_id + 1
 
     return state
+
 
 
 async def main_async():
@@ -328,18 +464,30 @@ async def main_async():
         reason=trade_row["reason"]
     )
 
+    # calcoli utili per spiegazione
+    w_cur = float(trade_row["w_current"])
+    w_tgt = float(trade_row["w_target"])
+    delta_w = w_tgt - w_cur
+
+    cost_pct = float(trade_row["cost_pct"])
+    edge_mult = float(params["edge_mult"])
+    required = cost_pct * edge_mult
+
     msg = (
         f"🕒 {hk} (Rome) – BTC/EUR – PAPER\n"
         f"Decisione: {trade_row['action']}\n"
-        f"w: {trade_row['w_current']:.2%} → {trade_row['w_target']:.2%} (after {trade_row['w_after']:.2%})\n"
-        f"Bid/Ask: {bid:.2f} / {ask:.2f} (spread {trade_row['spread_pct']:.2%})\n"
-        f"slip {trade_row['slippage_pct']:.2%} | fee {float(params['fee_taker']):.2%} | cost {trade_row['cost_pct']:.2%}\n"
-        f"r_hat: {r_hat:.2%}\n"
-        f"EUR: {float(new_state['paper_eur']):.2f} | BTC: {float(new_state['paper_btc']):.8f}\n"
+        f"Allocazione BTC: {w_cur:.2%} → {w_tgt:.2%}  (Δ {delta_w:+.2%}, after {float(trade_row['w_after']):.2%})\n"
+        f"Prezzo: bid {bid:.2f} | ask {ask:.2f} | spread {float(trade_row['spread_pct']):.2%}\n"
+        f"Costi worst: slip {float(trade_row['slippage_pct']):.2%} + fee {float(params['fee_taker']):.2%} + buffer {float(params['buffer']):.2%}\n"
+        f"Cost totale: {cost_pct:.2%}  | soglia richiesta (×{edge_mult:.2f}): {required:.2%}\n"
+        f"Forecast 1h (r_hat): {r_hat:.2%}\n"
+        f"Wallet: EUR {float(new_state['paper_eur']):.2f} | BTC {float(new_state['paper_btc']):.8f}\n"
         f"Equity: {equity2:.2f}€ | P&L oggi: {pnl_day:+.2f}€\n"
-        f"Reason: {trade_row['reason']}"
+        f"Motivo: {trade_row['reason']}\n"
+        f"Comandi: /status  /params  /set band 0.04  /pause  /resume  /kill"
     )
     await bot.send_message(chat_id=tg_chat, text=msg)
+
 
 
 def main():
