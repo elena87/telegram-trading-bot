@@ -1,12 +1,16 @@
 import os
 import math
+import asyncio
 import requests
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from telegram import Bot
 
-from supabase_db import db_get_state, db_update_state, db_get_params, db_log_command, db_insert_trade, db_upsert_snapshot
+from supabase_db import (
+    db_get_state, db_update_state, db_get_params,
+    db_log_command, db_insert_trade, db_upsert_snapshot
+)
 
 ROME = ZoneInfo("Europe/Rome")
 PRODUCT_ID = "BTC-EUR"
@@ -43,16 +47,16 @@ def fetch_last_60_candles_1m() -> list[tuple[float, float, float, float]]:
     r = requests.get(EXCHANGE_CANDLES_URL, params=params, timeout=10)
     r.raise_for_status()
     arr = r.json()
-    # Sort by time asc, take last 60 closed candles
-    arr.sort(key=lambda x: x[0])
+    arr.sort(key=lambda x: x[0])  # time asc
     last = arr[-60:]
-    candles = [(float(x[3]), float(x[4]), float(x[2]), float(x[1])) for x in last]  # open, close, high, low
+    # open, close, high, low
+    candles = [(float(x[3]), float(x[4]), float(x[2]), float(x[1])) for x in last]
     return candles
 
 
 def compute_features(candles: list[tuple[float, float, float, float]]) -> dict:
     closes = [c[1] for c in candles]
-    # Simple returns
+
     def ret(a, b):
         return math.log(b / a) if a > 0 else 0.0
 
@@ -60,8 +64,7 @@ def compute_features(candles: list[tuple[float, float, float, float]]) -> dict:
     r15 = ret(closes[-16], closes[-1]) if len(closes) >= 16 else 0.0
     r60 = ret(closes[0], closes[-1]) if len(closes) >= 60 else 0.0
 
-    # vol_1m: std dev of last 60 1m log-returns
-    rets = [ret(closes[i-1], closes[i]) for i in range(1, len(closes))]
+    rets = [ret(closes[i - 1], closes[i]) for i in range(1, len(closes))]
     if len(rets) >= 2:
         m = sum(rets) / len(rets)
         var = sum((x - m) ** 2 for x in rets) / (len(rets) - 1)
@@ -73,8 +76,7 @@ def compute_features(candles: list[tuple[float, float, float, float]]) -> dict:
 
 
 def forecast_r_hat(feat: dict) -> float:
-    # Placeholder robusto (inizio semplice): momentum 60m + una quota del 15m
-    # r_hat = expected log-return next hour (approx)
+    # modello base semplice (poi lo miglioreremo)
     return 0.7 * feat["r60"] + 0.3 * feat["r15"]
 
 
@@ -83,7 +85,6 @@ def map_rhat_to_wtarget(r_hat: float, w_current: float, w_max: float) -> float:
     r_dead = 0.0010   # 0.10%
     r_full = 0.0040   # 0.40%
 
-    # Deadzone: evita micro-ribilanciamenti
     if abs(r_hat) < r_dead:
         return w_current
 
@@ -92,12 +93,11 @@ def map_rhat_to_wtarget(r_hat: float, w_current: float, w_max: float) -> float:
     if r_hat >= r_full:
         return w_max
 
-    # interpolazione lineare tra [ -r_full .. +r_full ]
     t = (r_hat + r_full) / (2 * r_full)  # 0..1
     return w_min + t * (w_max - w_min)
 
 
-def paper_rebalance(state: dict, params: dict, bid: float, ask: float, mid: float, r_hat: float, feat: dict) -> tuple[dict, dict]:
+def paper_rebalance(state: dict, params: dict, bid: float, ask: float, mid: float, r_hat: float, feat: dict):
     eur = float(state["paper_eur"])
     btc = float(state["paper_btc"])
     equity = eur + btc * mid
@@ -105,7 +105,6 @@ def paper_rebalance(state: dict, params: dict, bid: float, ask: float, mid: floa
 
     spread_pct = (ask - bid) / mid if mid > 0 else 0.0
     slippage_base = float(params["slippage_base"])
-    # slippage worst-case: base o proporzionale a volatilità
     slippage_pct = max(slippage_base, 0.8 * float(feat["vol_1m"]))
     fee_pct = float(params["fee_taker"])
     buffer_pct = float(params["buffer"])
@@ -121,23 +120,18 @@ def paper_rebalance(state: dict, params: dict, bid: float, ask: float, mid: floa
 
     action = "HOLD"
     reason = ""
+    trade_value = 0.0
 
-    # band gate
     if abs(delta_w) < band:
         reason = f"band gate: |Δw|={abs(delta_w):.4f} < {band:.4f}"
-        trade_value = 0.0
+    elif abs(r_hat) <= cost_pct * edge_mult:
+        reason = f"cost gate: |r_hat|={abs(r_hat):.4f} <= cost_pct*{edge_mult:.2f} ({cost_pct*edge_mult:.4f})"
     else:
-        # cost gate (edge vs cost)
-        if abs(r_hat) <= cost_pct * edge_mult:
-            reason = f"cost gate: |r_hat|={abs(r_hat):.4f} <= cost_pct*{edge_mult:.2f} ({cost_pct*edge_mult:.4f})"
+        trade_value = abs(delta_w) * equity
+        trade_value = min(trade_value, equity / 24.0, max_trade_eur)
+        if trade_value < 2.0:
+            reason = f"min trade gate: trade_value={trade_value:.2f}€"
             trade_value = 0.0
-        else:
-            trade_value = abs(delta_w) * equity
-            trade_value = min(trade_value, equity / 24.0, max_trade_eur)
-            # se troppo piccolo, non fare nulla
-            if trade_value < 2.0:
-                reason = f"min trade gate: trade_value={trade_value:.2f}€"
-                trade_value = 0.0
 
     exec_price = None
     fee_eur = None
@@ -145,7 +139,6 @@ def paper_rebalance(state: dict, params: dict, bid: float, ask: float, mid: floa
 
     if trade_value > 0:
         if delta_w > 0:
-            # BUY worst-case: ask*(1+slip), fee taker su notional
             notional = min(trade_value, eur)
             if notional <= 0:
                 reason = "insufficient EUR"
@@ -157,25 +150,25 @@ def paper_rebalance(state: dict, params: dict, bid: float, ask: float, mid: floa
                 eur -= notional
                 btc += btc_bought
                 exec_price, fee_eur, notional_eur = exec_p, fee, notional
-                reason = reason or "rebalance up to w_target"
+                if not reason:
+                    reason = "rebalance up to w_target"
         else:
-            # SELL worst-case: bid*(1-slip), fee taker su proceeds
-            action = "SELL"
             exec_p = bid * (1.0 - slippage_pct)
             btc_to_sell = min(btc, trade_value / mid) if mid > 0 else 0.0
             if btc_to_sell <= 0:
                 action = "HOLD"
                 reason = "insufficient BTC"
             else:
+                action = "SELL"
                 eur_gross = btc_to_sell * exec_p
                 fee = eur_gross * fee_pct
                 eur_net = eur_gross - fee
                 btc -= btc_to_sell
                 eur += eur_net
                 exec_price, fee_eur, notional_eur = exec_p, fee, eur_gross
-                reason = reason or "rebalance down to w_target"
+                if not reason:
+                    reason = "rebalance down to w_target"
 
-    # recompute after trade
     equity2 = eur + btc * mid
     w_after = (btc * mid / equity2) if equity2 > 0 else 0.0
 
@@ -204,9 +197,10 @@ def paper_rebalance(state: dict, params: dict, bid: float, ask: float, mid: floa
     return new_state, trade_row
 
 
-def process_telegram_commands(bot: Bot, chat_id: str, state: dict, params: dict) -> dict:
+async def process_telegram_commands(bot: Bot, chat_id: str, state: dict) -> dict:
     offset = int(state.get("telegram_offset") or 0)
-    updates = bot.get_updates(offset=offset, timeout=0)
+
+    updates = await bot.get_updates(offset=offset, timeout=0)
     max_update_id = offset - 1
 
     for u in updates:
@@ -217,40 +211,29 @@ def process_telegram_commands(bot: Bot, chat_id: str, state: dict, params: dict)
         if not msg or not msg.text:
             continue
 
-        # accetta comandi solo dal chat_id previsto
         if str(msg.chat_id) != str(chat_id):
             continue
 
         text = msg.text.strip()
         db_log_command(msg.from_user.id if msg.from_user else None, text)
 
-        # comandi
         if text == "/pause":
             state["status"] = "PAUSED"
+            await bot.send_message(chat_id=chat_id, text="⏸️ Ok, bot in PAUSED.")
         elif text == "/resume":
             state["status"] = "RUNNING"
+            await bot.send_message(chat_id=chat_id, text="▶️ Ok, bot in RUNNING.")
         elif text == "/kill":
             state["kill_switch"] = True
-        elif text == "/paper":
-            state["mode"] = "PAPER"
-            state["armed"] = False
-        elif text == "/live":
-            state["mode"] = "LIVE"
-            state["armed"] = True
-        elif text == "/confirm_live":
-            # qui abiliteremo live quando avrai la API key LIVE
-            pass
-        elif text.startswith("/set "):
-            # /set band 0.05
-            parts = text.split()
-            if len(parts) == 3:
-                key = parts[1]
-                val = parts[2]
-                # per ora: parametri in tabella bot_params li cambieremo in una fase successiva
-                # (qui lasciamo log e messaggio di ritorno)
-                bot.send_message(chat_id=chat_id, text=f"Parametro {key}={val} ricevuto. (Config live nel prossimo step)")
+            await bot.send_message(chat_id=chat_id, text="🛑 Kill switch attivo. Il bot si fermerà.")
         elif text == "/status":
-            bot.send_message(chat_id=chat_id, text=f"Mode={state['mode']} Status={state['status']} Kill={state['kill_switch']} EUR={state['paper_eur']:.2f} BTC={state['paper_btc']:.8f}")
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"Mode={state['mode']} Status={state['status']} Kill={state['kill_switch']}\n"
+                    f"PAPER EUR={float(state['paper_eur']):.2f} BTC={float(state['paper_btc']):.8f}"
+                ),
+            )
 
     if updates:
         state["telegram_offset"] = max_update_id + 1
@@ -258,9 +241,7 @@ def process_telegram_commands(bot: Bot, chat_id: str, state: dict, params: dict)
     return state
 
 
-def main():
-    supabase_url = os.environ["SUPABASE_URL"]
-    supabase_key = os.environ["SUPABASE_SERVICE_KEY"]
+async def main_async():
     tg_token = os.environ["TELEGRAM_BOT_TOKEN"]
     tg_chat = os.environ["TELEGRAM_CHAT_ID"]
 
@@ -269,15 +250,15 @@ def main():
     state = db_get_state()
     params = db_get_params()
 
-    # processa comandi sempre, anche se non è l'ora “buona”
-    state = process_telegram_commands(bot, tg_chat, state, params)
+    # Leggi comandi (sempre)
+    state = await process_telegram_commands(bot, tg_chat, state)
     db_update_state(state)
 
     if state.get("kill_switch"):
-        bot.send_message(chat_id=tg_chat, text="🛑 Kill switch attivo. Bot fermo.")
+        await bot.send_message(chat_id=tg_chat, text="🛑 Kill switch attivo. Bot fermo.")
         return
 
-    # finestra operativa: primi 5 minuti dell'ora (compatibile con schedule ogni 5 min)
+    # Finestra: primi 5 minuti dell'ora
     t = now_rome()
     if t.minute >= 5:
         return
@@ -287,8 +268,7 @@ def main():
         return
 
     if state.get("status") != "RUNNING":
-        # aggiorna comunque last_processed_hour per non spammare? NO: meglio riprovare finché riprendi.
-        bot.send_message(chat_id=tg_chat, text=f"⏸️ Bot in PAUSED. Nessuna operazione per l'ora {hk}.")
+        await bot.send_message(chat_id=tg_chat, text=f"⏸️ Bot in PAUSED. Nessuna operazione per l'ora {hk}.")
         return
 
     bid, ask, mid = fetch_bid_ask()
@@ -296,7 +276,6 @@ def main():
     feat = compute_features(candles)
     r_hat = forecast_r_hat(feat)
 
-    # daily pnl baseline
     dk = day_key(t)
     eur = float(state["paper_eur"])
     btc = float(state["paper_btc"])
@@ -308,7 +287,6 @@ def main():
 
     new_state, trade_row = paper_rebalance(state, params, bid, ask, mid, r_hat, feat)
 
-    # salva stato + snapshot + trade
     new_state["last_processed_hour"] = hk
     db_update_state(new_state)
 
@@ -342,21 +320,23 @@ def main():
         reason=trade_row["reason"]
     )
 
-    # messaggio telegram
     msg = (
         f"🕒 {hk} (Rome) – BTC/EUR – PAPER\n"
         f"Decisione: {trade_row['action']}\n"
         f"w: {trade_row['w_current']:.2%} → {trade_row['w_target']:.2%} (after {trade_row['w_after']:.2%})\n"
         f"Bid/Ask: {bid:.2f} / {ask:.2f} (spread {trade_row['spread_pct']:.2%})\n"
-        f"slip {trade_row['slippage_pct']:.2%} | fee {params['fee_taker']:.2%} | cost {trade_row['cost_pct']:.2%}\n"
+        f"slip {trade_row['slippage_pct']:.2%} | fee {float(params['fee_taker']):.2%} | cost {trade_row['cost_pct']:.2%}\n"
         f"r_hat: {r_hat:.2%}\n"
-        f"EUR: {new_state['paper_eur']:.2f} | BTC: {new_state['paper_btc']:.8f}\n"
+        f"EUR: {float(new_state['paper_eur']):.2f} | BTC: {float(new_state['paper_btc']):.8f}\n"
         f"Equity: {equity2:.2f}€ | P&L oggi: {pnl_day:+.2f}€\n"
         f"Reason: {trade_row['reason']}"
     )
-    bot.send_message(chat_id=tg_chat, text=msg)
+    await bot.send_message(chat_id=tg_chat, text=msg)
+
+
+def main():
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":
     main()
-
