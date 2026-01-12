@@ -1,5 +1,6 @@
 import os
 import math
+import html
 import asyncio
 import requests
 from datetime import datetime, timezone
@@ -216,6 +217,11 @@ def parse_number(s: str) -> float:
     # accetta "0.05" o "0,05"
     return float(s.replace(",", "."))
 
+def h(x) -> str:
+    # Escape per Telegram HTML (non serve quote=True qui)
+    return html.escape(str(x), quote=False)
+
+
 
 def build_main_menu() -> InlineKeyboardMarkup:
     kb = [
@@ -344,7 +350,8 @@ async def process_telegram_commands(bot: Bot, chat_id: str, state: dict) -> dict
                 f"r_hat <code>{r_hat_lt*100:+.2f}%</code>  •  "
                 f"req <code>{required_lt*100:.2f}%</code>  •  "
                 f"Δedge <code>{delta_edge_lt*100:+.2f}%</code>\n"
-                f"<i>{last_trade.get('reason','')}</i>\n"
+                f"<i>{h(last_trade.get('reason',''))}</i>\n"
+
             )
 
         out += "\n<i>Tip: /params • /set band 0.04 • /pause • /resume</i>"
@@ -394,7 +401,9 @@ async def process_telegram_commands(bot: Bot, chat_id: str, state: dict) -> dict
             db_update_param("w_max", 0.50)
 
         p = db_get_params()
-        await bot.send_message(chat_id=chat_id, text=f"✅ Preset applicato.\n\n{format_params(p)}", reply_markup=build_main_menu(), parse_mode="HTML")
+        txt = f"✅ Preset applicato.\n\n<pre>{h(format_params(p))}</pre>"
+        await bot.send_message(chat_id=chat_id, text=txt, reply_markup=build_main_menu(), parse_mode="HTML")
+
 
     for u in updates:
         if u.update_id > max_update_id:
@@ -500,7 +509,12 @@ async def process_telegram_commands(bot: Bot, chat_id: str, state: dict) -> dict
         if text.startswith("/set "):
             parts = text.split()
             if len(parts) != 3:
-                await bot.send_message(chat_id=chat_id, text="Uso: /set <chiave> <valore>  (es: /set band 0.04)", reply_markup=build_main_menu(), parse_mode="HTML")
+                await bot.send_message(
+                chat_id=chat_id,
+                text="Uso: /set &lt;chiave&gt; &lt;valore&gt;  (es: /set band 0.04)",
+                reply_markup=build_main_menu(),
+                parse_mode="HTML"
+            )
                 continue
 
             key = parts[1].strip()
@@ -654,13 +668,6 @@ async def main_async():
     required = cost_pct * edge_mult
 
     run_time = t.strftime("%H:%M")
-    w_cur = float(trade_row["w_current"])
-    w_tgt = float(trade_row["w_target"])
-    delta_w = w_tgt - w_cur
-
-    cost_pct = float(trade_row["cost_pct"])
-    edge_mult = float(params["edge_mult"])
-    required = cost_pct * edge_mult
 
     action = trade_row["action"]
     action_emoji = "🟨" if action == "HOLD" else ("🟩" if action == "BUY" else "🟥")
@@ -706,16 +713,16 @@ async def main_async():
 
     # ---- Reason “umana” ----
     if "cost gate" in reason_raw:
-        reason = f"Edge insufficiente: <code>{abs(r_hat)*100:.2f}%</code> < <code>{required*100:.2f}%</code>"
+        reason = f"Edge insufficiente: <code>{abs(r_hat)*100:.2f}%</code> &lt; <code>{required*100:.2f}%</code>"
     elif "band gate" in reason_raw:
-        reason = f"Δw troppo piccolo: <code>{abs(delta_w)*100:.2f}%</code> < band <code>{band*100:.2f}%</code>"
+        reason = f"Δw troppo piccolo: <code>{abs(delta_w)*100:.2f}%</code> &lt; band <code>{band*100:.2f}%</code>"
     elif "min trade gate" in reason_raw:
         reason = "Importo trade troppo piccolo (min trade)"
     elif "insufficient" in reason_raw:
         reason = "Fondi insufficienti"
     else:
-        # fallback: usa il testo originale (non perfetto, ma ok)
-        reason = trade_row.get("reason", "")
+        reason = h(trade_row.get("reason", ""))
+
 
     msg = (
         f"<b>{action_emoji} BTC/EUR • PAPER</b>\n"
