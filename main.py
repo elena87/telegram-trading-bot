@@ -260,12 +260,20 @@ async def main_async():
 
     # Finestra: primi 5 minuti dell'ora
     t = now_rome()
-    if t.minute >= 5:
-        return
+
+    force = os.environ.get("FORCE_RUN", "").strip() == "1"
+    if not force:
+        # Finestra normale: primi 5 minuti dell'ora
+        if t.minute >= 5:
+            return
+
 
     hk = hour_key(t)
-    if state.get("last_processed_hour") == hk:
+    ignore_hourkey = os.environ.get("FORCE_IGNORE_HOURKEY", "").strip() == "1"
+
+    if (not ignore_hourkey) and state.get("last_processed_hour") == hk:
         return
+
 
     if state.get("status") != "RUNNING":
         await bot.send_message(chat_id=tg_chat, text=f"⏸️ Bot in PAUSED. Nessuna operazione per l'ora {hk}.")
