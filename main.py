@@ -470,7 +470,21 @@ async def process_telegram_commands(bot: Bot, chat_id: str, state: dict) -> dict
                 await bot.send_message(chat_id=chat_id, text="Valore fuori range (0..0.05).", reply_markup=build_main_menu())
                 continue
             if key == "edge_mult" and not (1.0 <= val <= 5.0):
-                await bot.send_me_
+                await bot.send_message(chat_id=chat_id, text="edge_mult fuori range (1..5).", reply_markup=build_main_menu())
+                continue
+            if key == "max_trade_eur" and val <= 0:
+                await bot.send_message(chat_id=chat_id, text="max_trade_eur deve essere > 0.", reply_markup=build_main_menu())
+                continue
+
+            db_update_param(key, val)
+            await bot.send_message(chat_id=chat_id, text=f"✅ Aggiornato: {key} = {val}", reply_markup=build_main_menu())
+            continue
+
+
+    if updates:
+        state["telegram_offset"] = max_update_id + 1
+
+    return state
 
 
 
@@ -486,8 +500,12 @@ async def main_async():
 
     # 1) commands mode: consuma update Telegram e risponde
     if run_mode == "commands":
-        state = await process_telegram_commands(bot, tg_chat, state)
+        state2 = await process_telegram_commands(bot, tg_chat, state)
+        if state2 is None:
+            state2 = state
+        state = state2
         db_update_state(state)
+
 
         if state.get("kill_switch"):
             # opzionale: conferma visiva
