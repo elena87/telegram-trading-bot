@@ -302,12 +302,17 @@ async def process_telegram_commands(bot: Bot, chat_id: str, state: dict) -> dict
 
         eur = float(state["paper_eur"])
         btc = float(state["paper_btc"])
+        now = now_rome()
+        last_hk = state.get("last_processed_hour")
+
 
         out = (
             f"📊 Status\n"
             f"- Mode: {state['mode']} | Status: {state['status']} | Kill: {state['kill_switch']}\n"
+            f"- Now (Rome): {now.strftime('%Y-%m-%d %H:%M')} | last_processed_hour: {last_hk}\n"
             f"- PAPER: EUR {fmt_eur(eur)} | BTC {fmt_btc(btc)}\n"
         )
+
 
         if snap:
             equity = float(snap["equity_total"])
