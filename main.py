@@ -7,6 +7,8 @@ from zoneinfo import ZoneInfo
 
 from telegram import Bot
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.error import BadRequest
+
 
 
 from supabase_db import (
@@ -360,7 +362,16 @@ async def process_telegram_commands(bot: Bot, chat_id: str, state: dict) -> dict
                 continue
 
             data = (cq.data or "").strip()
-            await bot.answer_callback_query(cq.id)
+            try:
+                await bot.answer_callback_query(cq.id)
+            except BadRequest as e:
+                # normale con bot "batch" (Actions): il callback può essere scaduto
+                msg = str(e).lower()
+                if "query is too old" in msg or "response timeout" in msg or "query id is invalid" in msg:
+                    pass
+                else:
+                    raise
+
 
             if data in ("MENU", "REFRESH"):
                 await send_menu("📌 Menu aggiornato")
