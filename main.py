@@ -505,6 +505,78 @@ async def process_telegram_commands(bot: Bot, chat_id: str, state: dict) -> dict
             await bot.send_message(chat_id=chat_id, text="🧹 Queue ripulita ✅", reply_markup=build_main_menu(), parse_mode="HTML")
             continue
 
+        # ===================== PAPER FUNDING COMMANDS =====================
+        if text.startswith("/fund ") or text.startswith("/addfund ") or text.startswith("/reset_paper "):
+            # Solo in PAPER
+            if state.get("mode") != "PAPER":
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ Comando disponibile solo in modalità PAPER.",
+                    reply_markup=build_main_menu(),
+                    parse_mode="HTML",
+                )
+                continue
+
+            parts = text.split()
+            if len(parts) != 2:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="Uso: /fund 2000  |  /addfund 200  |  /reset_paper 250",
+                    reply_markup=build_main_menu(),
+                    parse_mode="HTML",
+                )
+                continue
+
+            cmd = parts[0].strip()
+            try:
+                amount = float(parse_number(parts[1]))
+            except Exception:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ Importo non valido. Esempio: /fund 2000",
+                    reply_markup=build_main_menu(),
+                    parse_mode="HTML",
+                )
+                continue
+
+            if amount <= 0 or amount > 1_000_000:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="❌ Importo fuori range (0 .. 1.000.000).",
+                    reply_markup=build_main_menu(),
+                    parse_mode="HTML",
+                )
+                continue
+
+            eur_before = float(state.get("paper_eur") or 0.0)
+            btc_before = float(state.get("paper_btc") or 0.0)
+
+            if cmd == "/fund":
+                state["paper_eur"] = amount
+                delta = amount - eur_before
+                msg = f"💶 PAPER: EUR impostati a <code>{amount:.2f}</code> (Δ <code>{delta:+.2f}</code>). BTC invariati <code>{btc_before:.8f}</code>."
+
+            elif cmd == "/addfund":
+                state["paper_eur"] = eur_before + amount
+                msg = f"💶 PAPER: aggiunti <code>{amount:.2f}</code>. Nuovo EUR <code>{float(state['paper_eur']):.2f}</code>. BTC <code>{btc_before:.8f}</code>."
+
+            else:  # /reset_paper
+                state["paper_eur"] = amount
+                state["paper_btc"] = 0.0
+                # opzionale: se tieni pnl_day nello state
+                if "pnl_day" in state:
+                    state["pnl_day"] = 0.0
+                msg = f"🔁 PAPER reset: EUR <code>{amount:.2f}</code>, BTC <code>0.00000000</code>."
+
+            await bot.send_message(
+                chat_id=chat_id,
+                text=msg,
+                reply_markup=build_main_menu(),
+                parse_mode="HTML",
+            )
+            continue
+
+
 
         if text.startswith("/set "):
             parts = text.split()
