@@ -568,6 +568,50 @@ async def process_telegram_commands(bot: Bot, chat_id: str, state: dict) -> dict
                     state["pnl_day"] = 0.0
                 msg = f"🔁 PAPER reset: EUR <code>{amount:.2f}</code>, BTC <code>0.00000000</code>."
 
+
+                # --- dopo aver modificato state["paper_eur"]/["paper_btc"] e msg, prima di inviare ---
+                try:
+                    bid, ask, mid = fetch_bid_ask()
+                except Exception:
+                    bid = ask = mid = None
+
+                # riallinea day_start_equity per non far “saltare” il P&L day quando aggiungi fondi
+                now = now_rome()
+                dk = day_key(now)
+
+                # delta EUR effettivo: per /fund è (nuovo - prima), per /addfund è +amount, per reset è (nuovo - prima) ma BTC=0
+                eur_after = float(state.get("paper_eur") or 0.0)
+                btc_after = float(state.get("paper_btc") or 0.0)
+                delta_eur = eur_after - eur_before
+
+                # Se siamo nello stesso giorno, aggiungo il delta al day_start_equity così il P&L day non “include” i depositi
+                if state.get("day_key") == dk and state.get("day_start_equity") is not None and mid is not None:
+                    state["day_start_equity"] = float(state["day_start_equity"]) + delta_eur
+                else:
+                    # se non è settato o è nuovo giorno, inizializza coerente
+                    if mid is not None:
+                        state["day_key"] = dk
+                        state["day_start_equity"] = eur_after + btc_after * mid
+
+                # Scrivi subito uno snapshot coerente (così /status mostra equity giusta)
+                if mid is not None:
+                    equity_now = eur_after + btc_after * mid
+                    w_btc_now = (btc_after * mid / equity_now) if equity_now > 0 else 0.0
+                    pnl_day_now = equity_now - float(state.get("day_start_equity") or equity_now)
+
+                    db_upsert_snapshot(
+                        ts=now.astimezone(timezone.utc),
+                        mode=state.get("mode"),
+                        eur=eur_after,
+                        btc=btc_after,
+                        bid=bid, ask=ask, mid=mid,
+                        equity=equity_now,
+                        w_btc=w_btc_now,
+                        pnl_day=pnl_day_now,
+                        drawdown=None
+                    )
+
+
             await bot.send_message(
                 chat_id=chat_id,
                 text=msg,
